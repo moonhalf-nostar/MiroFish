@@ -1,6 +1,7 @@
 """
 本体生成服务
 接口1：分析文本内容，生成适合社会模拟的实体和关系类型定义
+支持同步和异步两种调用方式
 """
 
 import json
@@ -450,4 +451,45 @@ class OntologyGenerator:
         code_lines.append('}')
         
         return '\n'.join(code_lines)
+
+    async def generate_async(
+        self,
+        document_texts: List[str],
+        simulation_requirement: str,
+        additional_context: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        异步生成本体定义
+
+        Args:
+            document_texts: 文档文本列表
+            simulation_requirement: 模拟需求描述
+            additional_context: 额外上下文
+
+        Returns:
+            本体定义（entity_types, edge_types等）
+        """
+        # 构建用户消息
+        user_message = self._build_user_message(
+            document_texts,
+            simulation_requirement,
+            additional_context
+        )
+
+        messages = [
+            {"role": "system", "content": ONTOLOGY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message}
+        ]
+
+        # 调用异步 LLM
+        result = await self.llm_client.chat_json_async(
+            messages=messages,
+            temperature=0.3,
+            max_tokens=4096
+        )
+
+        # 验证和后处理
+        result = self._validate_and_process(result)
+
+        return result
 

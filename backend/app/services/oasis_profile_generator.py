@@ -1198,3 +1198,165 @@ class OasisProfileGenerator:
         logger.warning("save_profiles_to_json已废弃，请使用save_profiles方法")
         self.save_profiles(profiles, file_path, platform)
 
+    # ============== 异步方法 ==============
+
+    async def generate_profiles_from_entities_async(
+        self,
+        entities: List[EntityNode],
+        use_llm: bool = True,
+        progress_callback: Optional[callable] = None,
+        graph_id: Optional[str] = None,
+        parallel_count: int = 5,
+        realtime_output_path: Optional[str] = None,
+        output_platform: str = "reddit"
+    ) -> List[OasisAgentProfile]:
+        """
+        异步批量从实体生成Agent Profile
+        使用 asyncio.Semaphore 控制并发，asyncio.gather 并行生成
+
+        Args:
+            entities: 实体列表
+            use_llm: 是否使用LLM生成详细人设
+            progress_callback: 进度回调函数 (current, total, message)
+            graph_id: 图谱ID，用于Zep检索获取更丰富上下文
+            parallel_count: 并行生成数量，默认5
+            realtime_output_path: 实时写入的文件路径
+            output_platform: 输出平台格式 ("reddit" 或 "twitter")
+
+        Returns:
+            Agent Profile列表
+        """
+        import asyncio
+
+        # 设置graph_id用于Zep检索
+        if graph_id:
+            self.graph_id = graph_id
+
+        total = len(entities)
+        profiles = [None] * total  # 预分配列表保持顺序
+        completed_count = 0
+        semaphore = asyncio.Semaphore(parallel_count)
+        lock = asyncio.Lock()
+
+        # 实时写入文件的辅助函数
+        async def save_profiles_realtime():
+            """实时保存已生成的 profiles 到文件"""
+            if not realtime_output_path:
+                return
+
+            async with lock:
+                existing_profiles = [p for p in profiles if p is not None]
+                if not existing_profiles:
+                    return
+
+                try:
+                    if output_platform == "reddit":
+                        profiles_data = [p.to_reddit_format() for p in existing_profiles]
+                        # 使用 asyncio.to_thread 进行文件 IO
+                        await asyncio.to_thread(
+                            self._write_json_file, realtime_output_path, profiles_data
+                        )
+                    else:
+                        profiles_data = [p.to_twitter_format() for p in existing_profiles]
+                        await asyncio.to_thread(
+                            self._write_csv_file, realtime_output_path, profiles_data
+                        )
+                except Exception as e:
+                    logger.warning(f"实时保存 profiles 失败: {e}")
+
+        async def generate_single_profile_async(idx: int, entity: EntityNode) -> tuple:
+            """异步生成单个profile"""
+            nonlocal completed_count
+            entity_type = entity.get_entity_type() or "Entity"
+
+            async with semaphore:
+                try:
+                    # 使用 asyncio.to_thread 包装同步的 LLM 调用
+                    profile = await asyncio.to_thread(
+                        self.generate_profile_from_entity,
+                        entity=entity,
+                        user_id=idx,
+                        use_llm=use_llm
+                    )
+
+                    # 实时输出生成的人设
+                    self._print_generated_profile(entity.name, entity_type, profile)
+
+                    return idx, profile, None
+
+                except Exception as e:
+                    logger.error(f"生成实体 {entity.name} 的人设失败: {str(e)}")
+                    fallback_profile = OasisAgentProfile(
+                        user_id=idx,
+                        user_name=self._generate_username(entity.name),
+                        name=entity.name,
+                        bio=f"{entity_type}: {entity.name}",
+                        persona=entity.summary or "A participant in social discussions.",
+                        source_entity_uuid=entity.uuid,
+                        source_entity_type=entity_type,
+                    )
+                    return idx, fallback_profile, str(e)
+
+        logger.info(f"开始异步并行生成 {total} 个Agent人设（并行数: {parallel_count}）...")
+        print(f"\n{'='*60}")
+        print(f"开始生成Agent人设 - 共 {total} 个实体，异步并行数: {parallel_count}")
+        print(f"{'='*60}\n")
+
+        # 创建所有生成任务
+        tasks = [
+            generate_single_profile_async(idx, entity)
+            for idx, entity in enumerate(entities)
+        ]
+
+        # 使用 as_completed 风格处理结果以支持实时进度更新
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result_idx, profile, error = await coro
+                profiles[result_idx] = profile
+
+                async with lock:
+                    completed_count += 1
+                    current = completed_count
+
+                # 实时写入文件
+                await save_profiles_realtime()
+
+                entity = entities[result_idx]
+                entity_type = entity.get_entity_type() or "Entity"
+
+                if progress_callback:
+                    progress_callback(
+                        current,
+                        total,
+                        f"已完成 {current}/{total}: {entity.name}（{entity_type}）"
+                    )
+
+                if error:
+                    logger.warning(f"[{current}/{total}] {entity.name} 使用备用人设: {error}")
+                else:
+                    logger.info(f"[{current}/{total}] 成功生成人设: {entity.name} ({entity_type})")
+
+            except Exception as e:
+                logger.error(f"处理任务时发生异常: {str(e)}")
+
+        print(f"\n{'='*60}")
+        print(f"人设生成完成！共生成 {len([p for p in profiles if p])} 个Agent")
+        print(f"{'='*60}\n")
+
+        return profiles
+
+    def _write_json_file(self, path: str, data: list):
+        """辅助方法：写入JSON文件"""
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _write_csv_file(self, path: str, data: list):
+        """辅助方法：写入CSV文件"""
+        import csv
+        if data:
+            fieldnames = list(data[0].keys())
+            with open(path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(data)
+

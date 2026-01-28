@@ -1,7 +1,9 @@
 """
 MiroFish Backend 启动入口
+使用 Quart 异步框架
 """
 
+import asyncio
 import os
 import sys
 
@@ -20,10 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import create_app
 from app.config import Config
+from app.utils.logger import get_logger
 
+logger = get_logger('mirofish.run')
 
-def main():
-    """主函数"""
+async def main_async():
+    """异步主函数"""
     # 验证配置
     errors = Config.validate()
     if errors:
@@ -32,17 +36,23 @@ def main():
             print(f"  - {err}")
         print("\n请检查 .env 文件中的配置")
         sys.exit(1)
-    
+
     # 创建应用
     app = create_app()
-    
+
     # 获取运行配置
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
     port = int(os.environ.get('FLASK_PORT', 5001))
     debug = Config.DEBUG
-    
-    # 启动服务
-    app.run(host=host, port=port, debug=debug, threaded=True)
+
+    # 使用 Quart 的异步服务器启动
+    logger.info(f"启动服务器: host={host}, port={port}, debug={debug}")
+    await app.run_task(host=host, port=port, debug=debug)
+
+
+def main():
+    """主函数入口"""
+    asyncio.run(main_async())
 
 
 if __name__ == '__main__':

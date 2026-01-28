@@ -1,6 +1,7 @@
 """
 Zep检索工具服务
 封装图谱搜索、节点读取、边查询等工具，供Report Agent使用
+支持同步和异步两种调用方式
 
 核心检索工具（优化后）：
 1. InsightForge（深度洞察检索）- 最强大的混合检索，自动生成子问题并多维度检索
@@ -8,6 +9,7 @@ Zep检索工具服务
 3. QuickSearch（简单搜索）- 快速检索
 """
 
+import asyncio
 import time
 import json
 from typing import Dict, Any, List, Optional
@@ -1657,3 +1659,428 @@ class ZepToolsService:
             logger.warning(f"生成采访摘要失败: {e}")
             # 降级：简单拼接
             return f"共采访了{len(interviews)}位受访者，包括：" + "、".join([i.agent_name for i in interviews])
+
+    # ============== 异步方法 ==============
+
+    async def _call_with_retry_async(self, func, operation_name: str, max_retries: int = None):
+        """异步版本的带重试机制的API调用（使用 asyncio.to_thread 包装同步调用）"""
+        max_retries = max_retries or self.MAX_RETRIES
+        last_exception = None
+        delay = self.RETRY_DELAY
+
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.to_thread(func)
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Zep {operation_name} 第 {attempt + 1} 次尝试失败: {str(e)[:100]}, "
+                        f"{delay:.1f}秒后重试..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(f"Zep {operation_name} 在 {max_retries} 次尝试后仍失败: {str(e)}")
+
+        raise last_exception
+
+    async def search_graph_async(
+        self,
+        graph_id: str,
+        query: str,
+        limit: int = 10,
+        scope: str = "edges"
+    ) -> SearchResult:
+        """
+        异步图谱语义搜索
+
+        Args:
+            graph_id: 图谱ID
+            query: 搜索查询
+            limit: 返回结果数量
+            scope: 搜索范围
+
+        Returns:
+            SearchResult: 搜索结果
+        """
+        logger.info(f"异步图谱搜索: graph_id={graph_id}, query={query[:50]}...")
+
+        try:
+            search_results = await self._call_with_retry_async(
+                func=lambda: self.client.graph.search(
+                    graph_id=graph_id,
+                    query=query,
+                    limit=limit,
+                    scope=scope,
+                    reranker="cross_encoder"
+                ),
+                operation_name=f"图谱搜索(graph={graph_id})"
+            )
+
+            facts = []
+            edges = []
+            nodes = []
+
+            if hasattr(search_results, 'edges') and search_results.edges:
+                for edge in search_results.edges:
+                    if hasattr(edge, 'fact') and edge.fact:
+                        facts.append(edge.fact)
+                    edges.append({
+                        "uuid": getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', ''),
+                        "name": getattr(edge, 'name', ''),
+                        "fact": getattr(edge, 'fact', ''),
+                        "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
+                        "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
+                    })
+
+            if hasattr(search_results, 'nodes') and search_results.nodes:
+                for node in search_results.nodes:
+                    nodes.append({
+                        "uuid": getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                        "name": getattr(node, 'name', ''),
+                        "labels": getattr(node, 'labels', []),
+                        "summary": getattr(node, 'summary', ''),
+                    })
+                    if hasattr(node, 'summary') and node.summary:
+                        facts.append(f"[{node.name}]: {node.summary}")
+
+            logger.info(f"异步搜索完成: 找到 {len(facts)} 条相关事实")
+
+            return SearchResult(
+                facts=facts,
+                edges=edges,
+                nodes=nodes,
+                query=query,
+                total_count=len(facts)
+            )
+
+        except Exception as e:
+            logger.warning(f"Zep Search API失败，降级为本地搜索: {str(e)}")
+            return await asyncio.to_thread(
+                self._local_search, graph_id, query, limit, scope
+            )
+
+    async def get_all_nodes_async(self, graph_id: str) -> List[NodeInfo]:
+        """异步获取图谱的所有节点"""
+        logger.info(f"异步获取图谱 {graph_id} 的所有节点...")
+
+        nodes = await self._call_with_retry_async(
+            func=lambda: self.client.graph.node.get_by_graph_id(graph_id=graph_id),
+            operation_name=f"获取节点(graph={graph_id})"
+        )
+
+        result = []
+        for node in nodes:
+            result.append(NodeInfo(
+                uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                name=node.name or "",
+                labels=node.labels or [],
+                summary=node.summary or "",
+                attributes=node.attributes or {}
+            ))
+
+        logger.info(f"异步获取到 {len(result)} 个节点")
+        return result
+
+    async def get_all_edges_async(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
+        """异步获取图谱的所有边"""
+        logger.info(f"异步获取图谱 {graph_id} 的所有边...")
+
+        edges = await self._call_with_retry_async(
+            func=lambda: self.client.graph.edge.get_by_graph_id(graph_id=graph_id),
+            operation_name=f"获取边(graph={graph_id})"
+        )
+
+        result = []
+        for edge in edges:
+            edge_info = EdgeInfo(
+                uuid=getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', ''),
+                name=edge.name or "",
+                fact=edge.fact or "",
+                source_node_uuid=edge.source_node_uuid or "",
+                target_node_uuid=edge.target_node_uuid or ""
+            )
+
+            if include_temporal:
+                edge_info.created_at = getattr(edge, 'created_at', None)
+                edge_info.valid_at = getattr(edge, 'valid_at', None)
+                edge_info.invalid_at = getattr(edge, 'invalid_at', None)
+                edge_info.expired_at = getattr(edge, 'expired_at', None)
+
+            result.append(edge_info)
+
+        logger.info(f"异步获取到 {len(result)} 条边")
+        return result
+
+    async def insight_forge_async(
+        self,
+        graph_id: str,
+        query: str,
+        simulation_requirement: str,
+        report_context: str = "",
+        max_sub_queries: int = 5
+    ) -> InsightForgeResult:
+        """
+        异步版本的 InsightForge 深度洞察检索
+        使用 asyncio.gather 并行化子查询搜索
+        """
+        logger.info(f"异步 InsightForge 深度洞察检索: {query[:50]}...")
+
+        result = InsightForgeResult(
+            query=query,
+            simulation_requirement=simulation_requirement,
+            sub_queries=[]
+        )
+
+        # Step 1: 生成子问题（使用异步 LLM 调用）
+        sub_queries = await self._generate_sub_queries_async(
+            query=query,
+            simulation_requirement=simulation_requirement,
+            report_context=report_context,
+            max_queries=max_sub_queries
+        )
+        result.sub_queries = sub_queries
+        logger.info(f"生成 {len(sub_queries)} 个子问题")
+
+        # Step 2: 并行对所有子问题进行语义搜索
+        all_queries = sub_queries + [query]  # 包含原始查询
+        search_tasks = [
+            self.search_graph_async(graph_id=graph_id, query=sq, limit=15, scope="edges")
+            for sq in all_queries
+        ]
+
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        all_facts = []
+        all_edges = []
+        seen_facts = set()
+
+        for sr in search_results:
+            if isinstance(sr, Exception):
+                logger.warning(f"子查询搜索失败: {sr}")
+                continue
+            for fact in sr.facts:
+                if fact not in seen_facts:
+                    all_facts.append(fact)
+                    seen_facts.add(fact)
+            all_edges.extend(sr.edges)
+
+        result.semantic_facts = all_facts
+        result.total_facts = len(all_facts)
+
+        # Step 3: 提取实体 UUID 并并行获取节点信息
+        entity_uuids = set()
+        for edge_data in all_edges:
+            if isinstance(edge_data, dict):
+                source_uuid = edge_data.get('source_node_uuid', '')
+                target_uuid = edge_data.get('target_node_uuid', '')
+                if source_uuid:
+                    entity_uuids.add(source_uuid)
+                if target_uuid:
+                    entity_uuids.add(target_uuid)
+
+        # 并行获取节点详情
+        node_tasks = []
+        uuid_list = list(entity_uuids)
+        for uuid in uuid_list:
+            if uuid:
+                node_tasks.append(self._get_node_detail_async(uuid))
+
+        node_results = await asyncio.gather(*node_tasks, return_exceptions=True)
+
+        entity_insights = []
+        node_map = {}
+
+        for i, node in enumerate(node_results):
+            if isinstance(node, Exception) or node is None:
+                continue
+            node_map[uuid_list[i]] = node
+            entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "实体")
+            related_facts = [f for f in all_facts if node.name.lower() in f.lower()]
+            entity_insights.append({
+                "uuid": node.uuid,
+                "name": node.name,
+                "type": entity_type,
+                "summary": node.summary,
+                "related_facts": related_facts
+            })
+
+        result.entity_insights = entity_insights
+        result.total_entities = len(entity_insights)
+
+        # Step 4: 构建关系链
+        relationship_chains = []
+        for edge_data in all_edges:
+            if isinstance(edge_data, dict):
+                source_uuid = edge_data.get('source_node_uuid', '')
+                target_uuid = edge_data.get('target_node_uuid', '')
+                relation_name = edge_data.get('name', '')
+
+                source_name = node_map.get(source_uuid, NodeInfo('', '', [], '', {})).name or source_uuid[:8]
+                target_name = node_map.get(target_uuid, NodeInfo('', '', [], '', {})).name or target_uuid[:8]
+
+                chain = f"{source_name} --[{relation_name}]--> {target_name}"
+                if chain not in relationship_chains:
+                    relationship_chains.append(chain)
+
+        result.relationship_chains = relationship_chains
+        result.total_relationships = len(relationship_chains)
+
+        logger.info(f"异步 InsightForge 完成: {result.total_facts}条事实, {result.total_entities}个实体, {result.total_relationships}条关系")
+        return result
+
+    async def _get_node_detail_async(self, node_uuid: str) -> Optional[NodeInfo]:
+        """异步获取单个节点详情"""
+        try:
+            node = await self._call_with_retry_async(
+                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                operation_name=f"获取节点详情(uuid={node_uuid[:8]}...)"
+            )
+
+            if not node:
+                return None
+
+            return NodeInfo(
+                uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                name=node.name or "",
+                labels=node.labels or [],
+                summary=node.summary or "",
+                attributes=node.attributes or {}
+            )
+        except Exception as e:
+            logger.debug(f"异步获取节点详情失败: {e}")
+            return None
+
+    async def _generate_sub_queries_async(
+        self,
+        query: str,
+        simulation_requirement: str,
+        report_context: str = "",
+        max_queries: int = 5
+    ) -> List[str]:
+        """异步版本的子问题生成"""
+        system_prompt = """你是一个专业的问题分析专家。你的任务是将一个复杂问题分解为多个可以在模拟世界中独立观察的子问题。
+
+要求：
+1. 每个子问题应该足够具体，可以在模拟世界中找到相关的Agent行为或事件
+2. 子问题应该覆盖原问题的不同维度（如：谁、什么、为什么、怎么样、何时、何地）
+3. 子问题应该与模拟场景相关
+4. 返回JSON格式：{"sub_queries": ["子问题1", "子问题2", ...]}"""
+
+        user_prompt = f"""模拟需求背景：
+{simulation_requirement}
+
+{f"报告上下文：{report_context[:500]}" if report_context else ""}
+
+请将以下问题分解为{max_queries}个子问题：
+{query}
+
+返回JSON格式的子问题列表。"""
+
+        try:
+            response = await self.llm.chat_json_async(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3
+            )
+
+            sub_queries = response.get("sub_queries", [])
+            return [str(sq) for sq in sub_queries[:max_queries]]
+
+        except Exception as e:
+            logger.warning(f"异步生成子问题失败: {str(e)}，使用默认子问题")
+            return [
+                query,
+                f"{query} 的主要参与者",
+                f"{query} 的原因和影响",
+                f"{query} 的发展过程"
+            ][:max_queries]
+
+    async def panorama_search_async(
+        self,
+        graph_id: str,
+        query: str,
+        include_expired: bool = True,
+        limit: int = 50
+    ) -> PanoramaResult:
+        """异步版本的广度搜索"""
+        logger.info(f"异步 PanoramaSearch 广度搜索: {query[:50]}...")
+
+        result = PanoramaResult(query=query)
+
+        # 并行获取节点和边
+        all_nodes, all_edges = await asyncio.gather(
+            self.get_all_nodes_async(graph_id),
+            self.get_all_edges_async(graph_id, include_temporal=True)
+        )
+
+        node_map = {n.uuid: n for n in all_nodes}
+        result.all_nodes = all_nodes
+        result.total_nodes = len(all_nodes)
+        result.all_edges = all_edges
+        result.total_edges = len(all_edges)
+
+        # 分类事实
+        active_facts = []
+        historical_facts = []
+
+        for edge in all_edges:
+            if not edge.fact:
+                continue
+
+            is_historical = edge.is_expired or edge.is_invalid
+
+            if is_historical:
+                valid_at = edge.valid_at or "未知"
+                invalid_at = edge.invalid_at or edge.expired_at or "未知"
+                fact_with_time = f"[{valid_at} - {invalid_at}] {edge.fact}"
+                historical_facts.append(fact_with_time)
+            else:
+                active_facts.append(edge.fact)
+
+        # 排序
+        query_lower = query.lower()
+        keywords = [w.strip() for w in query_lower.replace(',', ' ').replace('，', ' ').split() if len(w.strip()) > 1]
+
+        def relevance_score(fact: str) -> int:
+            fact_lower = fact.lower()
+            score = 0
+            if query_lower in fact_lower:
+                score += 100
+            for kw in keywords:
+                if kw in fact_lower:
+                    score += 10
+            return score
+
+        active_facts.sort(key=relevance_score, reverse=True)
+        historical_facts.sort(key=relevance_score, reverse=True)
+
+        result.active_facts = active_facts[:limit]
+        result.historical_facts = historical_facts[:limit] if include_expired else []
+        result.active_count = len(active_facts)
+        result.historical_count = len(historical_facts)
+
+        logger.info(f"异步 PanoramaSearch 完成: {result.active_count}条有效, {result.historical_count}条历史")
+        return result
+
+    async def quick_search_async(
+        self,
+        graph_id: str,
+        query: str,
+        limit: int = 10
+    ) -> SearchResult:
+        """异步版本的快速搜索"""
+        logger.info(f"异步 QuickSearch 简单搜索: {query[:50]}...")
+
+        result = await self.search_graph_async(
+            graph_id=graph_id,
+            query=query,
+            limit=limit,
+            scope="edges"
+        )
+
+        logger.info(f"异步 QuickSearch 完成: {result.total_count}条结果")
+        return result

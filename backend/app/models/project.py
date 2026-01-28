@@ -238,7 +238,7 @@ class ProjectManager:
         return True
     
     @classmethod
-    def save_file_to_project(cls, project_id: str, file_storage, original_filename: str) -> Dict[str, str]:
+    async def save_file_to_project(cls, project_id: str, file_storage, original_filename: str) -> Dict[str, str]:
         """
         保存上传的文件到项目目录
         
@@ -259,7 +259,7 @@ class ProjectManager:
         file_path = os.path.join(files_dir, safe_filename)
         
         # 保存文件
-        file_storage.save(file_path)
+        await file_storage.save(file_path)
         
         # 获取文件大小
         file_size = os.path.getsize(file_path)

@@ -192,6 +192,54 @@ class RetryableAPIClient:
         
         raise last_exception
     
+    async def call_with_retry_async(
+        self,
+        func: Callable,
+        *args,
+        exceptions: Tuple[Type[Exception], ...] = (Exception,),
+        **kwargs
+    ) -> Any:
+        """
+        异步执行函数调用并在失败时重试
+
+        Args:
+            func: 要调用的异步函数
+            *args: 函数参数
+            exceptions: 需要重试的异常类型
+            **kwargs: 函数关键字参数
+
+        Returns:
+            函数返回值
+        """
+        import asyncio
+
+        last_exception = None
+        delay = self.initial_delay
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await func(*args, **kwargs)
+
+            except exceptions as e:
+                last_exception = e
+
+                if attempt == self.max_retries:
+                    logger.error(f"异步API调用在 {self.max_retries} 次重试后仍失败: {str(e)}")
+                    raise
+
+                current_delay = min(delay, self.max_delay)
+                current_delay = current_delay * (0.5 + random.random())
+
+                logger.warning(
+                    f"异步API调用第 {attempt + 1} 次尝试失败: {str(e)}, "
+                    f"{current_delay:.1f}秒后重试..."
+                )
+
+                await asyncio.sleep(current_delay)
+                delay *= self.backoff_factor
+
+        raise last_exception
+
     def call_batch_with_retry(
         self,
         items: list,

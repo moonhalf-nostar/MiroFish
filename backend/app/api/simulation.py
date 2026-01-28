@@ -1,11 +1,13 @@
 """
 模拟相关API路由
 Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
+使用Quart实现异步路由
 """
 
+import asyncio
 import os
 import traceback
-from flask import request, jsonify, send_file
+from quart import request, jsonify, send_file
 
 from . import simulation_bp
 from ..config import Config
@@ -45,12 +47,12 @@ def optimize_interview_prompt(prompt: str) -> str:
 # ============== 实体读取接口 ==============
 
 @simulation_bp.route('/entities/<graph_id>', methods=['GET'])
-def get_graph_entities(graph_id: str):
+async def get_graph_entities(graph_id: str):
     """
     获取图谱中的所有实体（已过滤）
-    
+
     只返回符合预定义实体类型的节点（Labels不只是Entity的节点）
-    
+
     Query参数：
         entity_types: 逗号分隔的实体类型列表（可选，用于进一步过滤）
         enrich: 是否获取相关边信息（默认true）
@@ -61,25 +63,26 @@ def get_graph_entities(graph_id: str):
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         entity_types_str = request.args.get('entity_types', '')
         entity_types = [t.strip() for t in entity_types_str.split(',') if t.strip()] if entity_types_str else None
         enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
+
         logger.info(f"获取图谱实体: graph_id={graph_id}, entity_types={entity_types}, enrich={enrich}")
-        
+
         reader = ZepEntityReader()
-        result = reader.filter_defined_entities(
+        # 使用异步方法
+        result = await reader.filter_defined_entities_async(
             graph_id=graph_id,
             defined_entity_types=entity_types,
             enrich_with_edges=enrich
         )
-        
+
         return jsonify({
             "success": True,
             "data": result.to_dict()
         })
-        
+
     except Exception as e:
         logger.error(f"获取图谱实体失败: {str(e)}")
         return jsonify({
@@ -90,7 +93,7 @@ def get_graph_entities(graph_id: str):
 
 
 @simulation_bp.route('/entities/<graph_id>/<entity_uuid>', methods=['GET'])
-def get_entity_detail(graph_id: str, entity_uuid: str):
+async def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
         if not Config.ZEP_API_KEY:
@@ -98,21 +101,21 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         reader = ZepEntityReader()
-        entity = reader.get_entity_with_context(graph_id, entity_uuid)
-        
+        entity = await asyncio.to_thread(reader.get_entity_with_context, graph_id, entity_uuid)
+
         if not entity:
             return jsonify({
                 "success": False,
                 "error": f"实体不存在: {entity_uuid}"
             }), 404
-        
+
         return jsonify({
             "success": True,
             "data": entity.to_dict()
         })
-        
+
     except Exception as e:
         logger.error(f"获取实体详情失败: {str(e)}")
         return jsonify({
@@ -123,7 +126,7 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 
 
 @simulation_bp.route('/entities/<graph_id>/by-type/<entity_type>', methods=['GET'])
-def get_entities_by_type(graph_id: str, entity_type: str):
+async def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
         if not Config.ZEP_API_KEY:
@@ -131,16 +134,17 @@ def get_entities_by_type(graph_id: str, entity_type: str):
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
+
         reader = ZepEntityReader()
-        entities = reader.get_entities_by_type(
-            graph_id=graph_id,
-            entity_type=entity_type,
-            enrich_with_edges=enrich
+        entities = await asyncio.to_thread(
+            reader.get_entities_by_type,
+            graph_id,
+            entity_type,
+            enrich
         )
-        
+
         return jsonify({
             "success": True,
             "data": {
@@ -149,7 +153,7 @@ def get_entities_by_type(graph_id: str, entity_type: str):
                 "entities": [e.to_dict() for e in entities]
             }
         })
-        
+
     except Exception as e:
         logger.error(f"获取实体失败: {str(e)}")
         return jsonify({
@@ -162,12 +166,12 @@ def get_entities_by_type(graph_id: str, entity_type: str):
 # ============== 模拟管理接口 ==============
 
 @simulation_bp.route('/create', methods=['POST'])
-def create_simulation():
+async def create_simulation():
     """
     创建新的模拟
-    
+
     注意：max_rounds等参数由LLM智能生成，无需手动设置
-    
+
     请求（JSON）：
         {
             "project_id": "proj_xxxx",      // 必填
@@ -175,7 +179,7 @@ def create_simulation():
             "enable_twitter": true,          // 可选，默认true
             "enable_reddit": true            // 可选，默认true
         }
-    
+
     返回：
         {
             "success": true,
@@ -191,29 +195,29 @@ def create_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
-        
+        data = await request.get_json() or {}
+
         project_id = data.get('project_id')
         if not project_id:
             return jsonify({
                 "success": False,
                 "error": "请提供 project_id"
             }), 400
-        
+
         project = ProjectManager.get_project(project_id)
         if not project:
             return jsonify({
                 "success": False,
                 "error": f"项目不存在: {project_id}"
             }), 404
-        
+
         graph_id = data.get('graph_id') or project.graph_id
         if not graph_id:
             return jsonify({
                 "success": False,
                 "error": "项目尚未构建图谱，请先调用 /api/graph/build"
             }), 400
-        
+
         manager = SimulationManager()
         state = manager.create_simulation(
             project_id=project_id,
@@ -221,12 +225,12 @@ def create_simulation():
             enable_twitter=data.get('enable_twitter', True),
             enable_reddit=data.get('enable_reddit', True),
         )
-        
+
         return jsonify({
             "success": True,
             "data": state.to_dict()
         })
-        
+
     except Exception as e:
         logger.error(f"创建模拟失败: {str(e)}")
         return jsonify({
@@ -356,25 +360,25 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
 
 
 @simulation_bp.route('/prepare', methods=['POST'])
-def prepare_simulation():
+async def prepare_simulation():
     """
     准备模拟环境（异步任务，LLM智能生成所有参数）
-    
+
     这是一个耗时操作，接口会立即返回task_id，
     使用 GET /api/simulation/prepare/status 查询进度
-    
+
     特性：
     - 自动检测已完成的准备工作，避免重复生成
     - 如果已准备完成，直接返回已有结果
     - 支持强制重新生成（force_regenerate=true）
-    
+
     步骤：
     1. 检查是否已有完成的准备工作
     2. 从Zep图谱读取并过滤实体
     3. 为每个实体生成OASIS Agent Profile（带重试机制）
     4. LLM智能生成模拟配置（带重试机制）
     5. 保存配置文件和预设脚本
-    
+
     请求（JSON）：
         {
             "simulation_id": "sim_xxxx",                   // 必填，模拟ID
@@ -383,7 +387,7 @@ def prepare_simulation():
             "parallel_profile_count": 5,                  // 可选，并行生成人设数量，默认5
             "force_regenerate": false                     // 可选，强制重新生成，默认false
         }
-    
+
     返回：
         {
             "success": true,
@@ -396,13 +400,12 @@ def prepare_simulation():
             }
         }
     """
-    import threading
     import os
     from ..models.task import TaskManager, TaskStatus
     from ..config import Config
-    
+
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -602,10 +605,13 @@ def prepare_simulation():
                     state.error = str(e)
                     manager._save_simulation_state(state)
         
-        # 启动后台线程
-        thread = threading.Thread(target=run_prepare, daemon=True)
-        thread.start()
-        
+        # 定义异步后台任务包装器
+        async def run_prepare_async():
+            await asyncio.to_thread(run_prepare)
+
+        # 启动异步后台任务
+        asyncio.create_task(run_prepare_async())
+
         return jsonify({
             "success": True,
             "data": {
@@ -618,7 +624,7 @@ def prepare_simulation():
                 "entity_types": state.entity_types  # 实体类型列表
             }
         })
-        
+
     except ValueError as e:
         return jsonify({
             "success": False,
@@ -635,20 +641,20 @@ def prepare_simulation():
 
 
 @simulation_bp.route('/prepare/status', methods=['POST'])
-def get_prepare_status():
+async def get_prepare_status():
     """
     查询准备任务进度
-    
+
     支持两种查询方式：
     1. 通过task_id查询正在进行的任务进度
     2. 通过simulation_id检查是否已有完成的准备工作
-    
+
     请求（JSON）：
         {
             "task_id": "task_xxxx",          // 可选，prepare返回的task_id
             "simulation_id": "sim_xxxx"      // 可选，模拟ID（用于检查已完成的准备）
         }
-    
+
     返回：
         {
             "success": true,
@@ -663,9 +669,9 @@ def get_prepare_status():
         }
     """
     from ..models.task import TaskManager
-    
+
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
@@ -748,29 +754,29 @@ def get_prepare_status():
 
 
 @simulation_bp.route('/<simulation_id>', methods=['GET'])
-def get_simulation(simulation_id: str):
+async def get_simulation(simulation_id: str):
     """获取模拟状态"""
     try:
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
-        
+
         if not state:
             return jsonify({
                 "success": False,
                 "error": f"模拟不存在: {simulation_id}"
             }), 404
-        
+
         result = state.to_dict()
-        
+
         # 如果模拟已准备好，附加运行说明
         if state.status == SimulationStatus.READY:
             result["run_instructions"] = manager.get_run_instructions(simulation_id)
-        
+
         return jsonify({
             "success": True,
             "data": result
         })
-        
+
     except Exception as e:
         logger.error(f"获取模拟状态失败: {str(e)}")
         return jsonify({
@@ -781,16 +787,16 @@ def get_simulation(simulation_id: str):
 
 
 @simulation_bp.route('/list', methods=['GET'])
-def list_simulations():
+async def list_simulations():
     """
     列出所有模拟
-    
+
     Query参数：
         project_id: 按项目ID过滤（可选）
     """
     try:
         project_id = request.args.get('project_id')
-        
+
         manager = SimulationManager()
         simulations = manager.list_simulations(project_id=project_id)
         
@@ -869,7 +875,7 @@ def _get_report_id_for_simulation(simulation_id: str) -> str:
 
 
 @simulation_bp.route('/history', methods=['GET'])
-def get_simulation_history():
+async def get_simulation_history():
     """
     获取历史模拟列表（带项目详情）
     
@@ -983,7 +989,7 @@ def get_simulation_history():
 
 
 @simulation_bp.route('/<simulation_id>/profiles', methods=['GET'])
-def get_simulation_profiles(simulation_id: str):
+async def get_simulation_profiles(simulation_id: str):
     """
     获取模拟的Agent Profile
     
@@ -1021,7 +1027,7 @@ def get_simulation_profiles(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/profiles/realtime', methods=['GET'])
-def get_simulation_profiles_realtime(simulation_id: str):
+async def get_simulation_profiles_realtime(simulation_id: str):
     """
     实时获取模拟的Agent Profile（用于在生成过程中实时查看进度）
     
@@ -1131,7 +1137,7 @@ def get_simulation_profiles_realtime(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/config/realtime', methods=['GET'])
-def get_simulation_config_realtime(simulation_id: str):
+async def get_simulation_config_realtime(simulation_id: str):
     """
     实时获取模拟配置（用于在生成过程中实时查看进度）
     
@@ -1251,7 +1257,7 @@ def get_simulation_config_realtime(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/config', methods=['GET'])
-def get_simulation_config(simulation_id: str):
+async def get_simulation_config(simulation_id: str):
     """
     获取模拟配置（LLM智能生成的完整配置）
     
@@ -1287,7 +1293,7 @@ def get_simulation_config(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/config/download', methods=['GET'])
-def download_simulation_config(simulation_id: str):
+async def download_simulation_config(simulation_id: str):
     """下载模拟配置文件"""
     try:
         manager = SimulationManager()
@@ -1316,7 +1322,7 @@ def download_simulation_config(simulation_id: str):
 
 
 @simulation_bp.route('/script/<script_name>/download', methods=['GET'])
-def download_simulation_script(script_name: str):
+async def download_simulation_script(script_name: str):
     """
     下载模拟运行脚本文件（通用脚本，位于 backend/scripts/）
     
@@ -1370,7 +1376,7 @@ def download_simulation_script(script_name: str):
 # ============== Profile生成接口（独立使用） ==============
 
 @simulation_bp.route('/generate-profiles', methods=['POST'])
-def generate_profiles():
+async def generate_profiles():
     """
     直接从图谱生成OASIS Agent Profile（不创建模拟）
     
@@ -1383,7 +1389,7 @@ def generate_profiles():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         graph_id = data.get('graph_id')
         if not graph_id:
@@ -1444,7 +1450,7 @@ def generate_profiles():
 # ============== 模拟运行控制接口 ==============
 
 @simulation_bp.route('/start', methods=['POST'])
-def start_simulation():
+async def start_simulation():
     """
     开始运行模拟
 
@@ -1485,7 +1491,7 @@ def start_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
 
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -1637,7 +1643,7 @@ def start_simulation():
 
 
 @simulation_bp.route('/stop', methods=['POST'])
-def stop_simulation():
+async def stop_simulation():
     """
     停止模拟
     
@@ -1657,7 +1663,7 @@ def stop_simulation():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         if not simulation_id:
@@ -1698,7 +1704,7 @@ def stop_simulation():
 # ============== 实时状态监控接口 ==============
 
 @simulation_bp.route('/<simulation_id>/run-status', methods=['GET'])
-def get_run_status(simulation_id: str):
+async def get_run_status(simulation_id: str):
     """
     获取模拟运行实时状态（用于前端轮询）
     
@@ -1756,7 +1762,7 @@ def get_run_status(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/run-status/detail', methods=['GET'])
-def get_run_status_detail(simulation_id: str):
+async def get_run_status_detail(simulation_id: str):
     """
     获取模拟运行详细状态（包含所有动作）
     
@@ -1857,7 +1863,7 @@ def get_run_status_detail(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/actions', methods=['GET'])
-def get_simulation_actions(simulation_id: str):
+async def get_simulation_actions(simulation_id: str):
     """
     获取模拟中的Agent动作历史
     
@@ -1911,7 +1917,7 @@ def get_simulation_actions(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/timeline', methods=['GET'])
-def get_simulation_timeline(simulation_id: str):
+async def get_simulation_timeline(simulation_id: str):
     """
     获取模拟时间线（按轮次汇总）
     
@@ -1951,7 +1957,7 @@ def get_simulation_timeline(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/agent-stats', methods=['GET'])
-def get_agent_stats(simulation_id: str):
+async def get_agent_stats(simulation_id: str):
     """
     获取每个Agent的统计信息
     
@@ -1980,7 +1986,7 @@ def get_agent_stats(simulation_id: str):
 # ============== 数据库查询接口 ==============
 
 @simulation_bp.route('/<simulation_id>/posts', methods=['GET'])
-def get_simulation_posts(simulation_id: str):
+async def get_simulation_posts(simulation_id: str):
     """
     获取模拟中的帖子
     
@@ -2058,7 +2064,7 @@ def get_simulation_posts(simulation_id: str):
 
 
 @simulation_bp.route('/<simulation_id>/comments', methods=['GET'])
-def get_simulation_comments(simulation_id: str):
+async def get_simulation_comments(simulation_id: str):
     """
     获取模拟中的评论（仅Reddit）
     
@@ -2135,7 +2141,7 @@ def get_simulation_comments(simulation_id: str):
 # ============== Interview 采访接口 ==============
 
 @simulation_bp.route('/interview', methods=['POST'])
-def interview_agent():
+async def interview_agent():
     """
     采访单个Agent
 
@@ -2186,7 +2192,7 @@ def interview_agent():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         agent_id = data.get('agent_id')
@@ -2264,7 +2270,7 @@ def interview_agent():
 
 
 @simulation_bp.route('/interview/batch', methods=['POST'])
-def interview_agents_batch():
+async def interview_agents_batch():
     """
     批量采访多个Agent
 
@@ -2308,7 +2314,7 @@ def interview_agents_batch():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
 
         simulation_id = data.get('simulation_id')
         interviews = data.get('interviews')
@@ -2402,7 +2408,7 @@ def interview_agents_batch():
 
 
 @simulation_bp.route('/interview/all', methods=['POST'])
-def interview_all_agents():
+async def interview_all_agents():
     """
     全局采访 - 使用相同问题采访所有Agent
 
@@ -2435,7 +2441,7 @@ def interview_all_agents():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
 
         simulation_id = data.get('simulation_id')
         prompt = data.get('prompt')
@@ -2505,7 +2511,7 @@ def interview_all_agents():
 
 
 @simulation_bp.route('/interview/history', methods=['POST'])
-def get_interview_history():
+async def get_interview_history():
     """
     获取Interview历史记录
 
@@ -2539,7 +2545,7 @@ def get_interview_history():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         platform = data.get('platform')  # 不指定则返回两个平台的历史
@@ -2577,7 +2583,7 @@ def get_interview_history():
 
 
 @simulation_bp.route('/env-status', methods=['POST'])
-def get_env_status():
+async def get_env_status():
     """
     获取模拟环境状态
 
@@ -2601,7 +2607,7 @@ def get_env_status():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         
@@ -2642,7 +2648,7 @@ def get_env_status():
 
 
 @simulation_bp.route('/close-env', methods=['POST'])
-def close_simulation_env():
+async def close_simulation_env():
     """
     关闭模拟环境
     
@@ -2668,7 +2674,7 @@ def close_simulation_env():
         }
     """
     try:
-        data = request.get_json() or {}
+        data = await request.get_json() or {}
         
         simulation_id = data.get('simulation_id')
         timeout = data.get('timeout', 30)
